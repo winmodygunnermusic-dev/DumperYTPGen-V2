@@ -209,7 +209,8 @@ class FFmpegUtils:
         """
         Concat clips using ffmpeg concat demuxer.
         Writes a temporary list file in a format FFmpeg accepts on the current platform.
-        Skips missing files and logs them. Returns ffmpeg exit code.
+        If the demuxer fails, falls back to an encoded filter_complex concat.
+        Returns ffmpeg exit code.
         """
         from tempfile import NamedTemporaryFile
 
@@ -227,15 +228,13 @@ class FFmpegUtils:
                 on_log("[concat_clips] No valid input files found for concatenation.")
             return 1
 
-        # Create list file appropriate for platform
+        # Try concat demuxer first (fast copy)
         with NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as f:
             for c in existing:
                 abspath = os.path.abspath(c)
                 if os.name == "nt":
-                    # Windows: use double quotes around the path (avoids issues with backslashes)
                     line = 'file "{}"\n'.format(abspath)
                 else:
-                    # POSIX: escape single quotes and use single-quoted path
                     safe = abspath.replace("'", "'\\''")
                     line = "file '{}'\n".format(safe)
                 f.write(line)
@@ -243,15 +242,43 @@ class FFmpegUtils:
 
         try:
             args = ["-f", "concat", "-safe", "0", "-i", listpath, "-c", "copy", dst]
+            if on_log:
+                on_log(f"[concat_clips] Attempting concat demuxer with {len(existing)} files.")
             rc = self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
-            if rc != 0 and on_log:
-                on_log(f"[concat_clips] ffmpeg concat demuxer returned code {rc}")
-            return rc
+            if rc == 0:
+                return rc
+            else:
+                if on_log:
+                    on_log(f"[concat_clips] concat demuxer failed (code {rc}), falling back to filter_complex concat.")
         finally:
             try:
                 os.remove(listpath)
             except Exception:
                 pass
+
+        # Fallback: filter_complex concat with re-encoding.
+        try:
+            n = len(existing)
+            args = []
+            for p in existing:
+                args += ["-i", p]
+
+            # Build filter_complex: [0:v:0][0:a:0][1:v:0][1:a:0]... concat=n={n}:v=1:a=1 [v][a]
+            v_and_a = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+            filter_complex = f"{v_and_a}concat=n={n}:v=1:a=1[v][a]"
+            args += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-c:a", "aac", "-b:a", "192k", dst]
+            if on_log:
+                on_log(f"[concat_clips] Running filter_complex concat (re-encode) for {n} files.")
+            rc2 = self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
+            if on_log and rc2 != 0:
+                on_log(f"[concat_clips] filter_complex concat failed with code {rc2}")
+            return rc2
+        except Exception as e:
+            if on_log:
+                on_log(f"[concat_clips] Exception during fallback concat: {e}")
+            return 1
 
     def apply_filters(
         self,

@@ -1,144 +1,306 @@
+# ffmpeg_utils.py
 """
-export_manager.py
+ffmpeg_utils.py
 
-Handles assembling the final YTP project and exporting via FFmpeg.
+Utility wrapper around ffmpeg and ffprobe.
 
-- Combines clips
-- Applies overlays and audio layers through filter_complex construction
-- Exposes progress updates and allows canceling
+- Detects ffmpeg/ffprobe in PATH or configured locations.
+- Provides methods to probe media (duration, streams).
+- Provides helpers to run ffmpeg commands with progress parsing and cancellation.
 """
 
-import os
+import subprocess
 import threading
-import tempfile
-from typing import List, Dict, Any, Optional, Callable
-from ffmpeg_utils import FFmpegUtils
-from config import ConfigManager
+import shutil
+import os
+import json
+import re
+from typing import Optional, Dict, Any, Callable, List
 from pathlib import Path
-import uuid
-import shlex
+from config import ConfigManager
+
+class FFmpegNotFoundError(RuntimeError):
+    pass
 
 
-class ExportManager:
+class FFmpegUtils:
     """
-    Orchestrates export of a project into a final MP4 using FFmpeg.
+    Wrapper for FFmpeg and FFprobe invocation.
     """
 
-    def __init__(self, config: ConfigManager, ffutils: FFmpegUtils):
+    TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+    def __init__(self, config: ConfigManager):
         self.config = config
-        self.ffutils = ffutils
-        self._cancel_event = threading.Event()
-        self._proc_thread: Optional[threading.Thread] = None
-        self._progress_callback: Optional[Callable[[float], None]] = None
-        self._log_callback: Optional[Callable[[str], None]] = None
+        self.ffmpeg_path = config.get("ffmpeg_path")
+        self.ffprobe_path = config.get("ffprobe_path")
+        self._detect()
 
-    def cancel(self):
-        self._cancel_event.set()
+    def _detect(self):
+        # Use configured paths if provided, else try PATH
+        if self.ffmpeg_path and Path(self.ffmpeg_path).exists():
+            ffmpeg = self.ffmpeg_path
+        else:
+            ffmpeg = shutil.which("ffmpeg")
 
-    def _reset(self):
-        self._cancel_event.clear()
+        if self.ffprobe_path and Path(self.ffprobe_path).exists():
+            ffprobe = self.ffprobe_path
+        else:
+            ffprobe = shutil.which("ffprobe")
 
-    def export_project(
+        self.ffmpeg_exec = ffmpeg
+        self.ffprobe_exec = ffprobe
+
+        if not self.ffmpeg_exec or not self.ffprobe_exec:
+            raise FFmpegNotFoundError(
+                "FFmpeg or FFprobe not found. Please install them and ensure they are on PATH, "
+                "or set their paths in the app configuration."
+            )
+
+    def probe(self, filepath: str) -> Dict[str, Any]:
+        """
+        Run ffprobe to get file info JSON.
+        """
+        cmd = [
+            self.ffprobe_exec,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            filepath,
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {proc.stderr.decode(errors='ignore')}")
+        return json.loads(proc.stdout.decode("utf-8"))
+
+    def get_duration(self, filepath: str) -> float:
+        info = self.probe(filepath)
+        fmt = info.get("format", {})
+        duration = fmt.get("duration")
+        if duration is None:
+            # try stream durations
+            streams = info.get("streams", [])
+            for s in streams:
+                if "duration" in s:
+                    duration = s["duration"]
+                    break
+        try:
+            return float(duration) if duration else 0.0
+        except Exception:
+            return 0.0
+
+    def run_ffmpeg_with_progress(
         self,
-        clip_paths: List[str],
-        overlays: List[Dict[str, Any]],
-        sfx: List[Dict[str, Any]],
-        music_track: Optional[str],
-        output_path: str,
-        bitrate: str = "2000k",
+        args: List[str],
         on_progress: Optional[Callable[[float], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
-    ):
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
         """
-        Start export in a background thread. on_progress receives seconds processed or percent depending on implementation.
+        Run ffmpeg command (full args list) and parse stderr for progress. Returns exit code.
+
+        on_progress receives seconds processed (float) if time= is parsed.
+        on_log receives raw stderr lines.
+        cancel_event if set will terminate the process when set.
         """
+        cmd = [self.ffmpeg_exec, "-y"] + args
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1
+        )
 
-        def _run():
-            try:
-                self._reset()
-                self._progress_callback = on_progress
-                self._log_callback = on_log
-
-                # Strategy:
-                # 1) Concatenate clips into a single input (re-encode for uniformity).
-                concat_temp = str(Path(tempfile.gettempdir()) / f"ytp_concat_{uuid.uuid4().hex}.mp4")
+        def _reader(stream):
+            for line in stream:
+                line_stripped = line.strip()
                 if on_log:
-                    on_log(f"Concatenating {len(clip_paths)} clips...")
-                rc = self.ffutils.concat_clips(clip_paths, concat_temp, on_progress=on_progress, cancel_event=self._cancel_event)
-                if rc != 0:
-                    if on_log:
-                        on_log("Concatenation returned non-zero exit code; attempting sequential filter concat.")
-                    # fall back to filter_complex concat (not implemented here for brevity)
-                # 2) Build filter_complex string for overlays and sfx/music mixing
-                filter_parts = []
-                inputs = [concat_temp]
-                for ov in overlays:
-                    inputs.append(ov["path"])
-                if music_track:
-                    inputs.append(music_track)
-                # For simplicity, if overlays exist, we'll overlay them using simple overlay at specified times/positions
-                # A production-ready version would build a complex timeline-aware filter. Here we apply static overlay(s).
-                args = []
-                for inp in inputs:
-                    args += ["-i", inp]
-                # Build base mapping and filter_complex
-                filter_complex = ""
-                cur_video = "[0:v]"
-                # overlay inputs start at index 1...
-                idx = 1
-                overlay_count = 0
-                for ov in overlays:
-                    pos = ov.get("position", "center")
-                    if pos == "top-left":
-                        xy = "0:0"
-                    elif pos == "top-right":
-                        xy = "main_w-overlay_w:0"
-                    elif pos == "bottom-left":
-                        xy = "0:main_h-overlay_h"
-                    elif pos == "bottom-right":
-                        xy = "main_w-overlay_w:main_h-overlay_h"
-                    else:
-                        xy = "(main_w-overlay_w)/2:(main_h-overlay_h)/2"
-                    filter_complex += f"{cur_video}[{idx}:v] overlay=x={xy} [tmp{overlay_count}];"
-                    cur_video = f"[tmp{overlay_count}]"
-                    idx += 1
-                    overlay_count += 1
-                # audio mixing: simple amix of concat audio + sfx + music (if present)
-                # map video and audio outputs
-                final_video_map = cur_video if overlay_count > 0 else "[0:v]"
-                # Put final output together by writing to temp processed file
-                processed_temp = str(Path(tempfile.gettempdir()) / f"ytp_processed_{uuid.uuid4().hex}.mp4")
-                full_args = []
-                if filter_complex:
-                    full_args += ["-filter_complex", filter_complex.rstrip(";")]
-                    # map video from last tmp and audio from 0
-                    full_args += ["-map", final_video_map, "-map", "0:a?"]
-                # encoding settings
-                full_args += ["-c:v", "libx264", "-b:v", bitrate, "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k", processed_temp]
-                # Run ffmpeg with inputs and filter_complex
-                rc = self.ffutils.run_ffmpeg_with_progress(full_args, on_progress=on_progress, on_log=on_log, cancel_event=self._cancel_event)
-                if rc != 0:
-                    if on_log:
-                        on_log(f"FFmpeg processing failed with code {rc}")
-                    return
-                # Move processed temp to output
-                try:
-                    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-                    Path(processed_temp).replace(output_path)
-                    if on_log:
-                        on_log(f"Export complete: {output_path}")
-                except Exception as e:
-                    if on_log:
-                        on_log(f"Failed to finalize output: {e}")
-            finally:
-                # cleanup
-                try:
-                    if 'concat_temp' in locals() and Path(concat_temp).exists():
-                        Path(concat_temp).unlink()
-                except Exception:
-                    pass
+                    on_log(line_stripped)
+                m = self.TIME_RE.search(line_stripped)
+                if m and on_progress:
+                    try:
+                        hours = float(m.group(1))
+                        mins = float(m.group(2))
+                        secs = float(m.group(3))
+                        total_seconds = hours * 3600 + mins * 60 + secs
+                        on_progress(total_seconds)
+                    except Exception:
+                        pass
 
-        t = threading.Thread(target=_run, daemon=True)
-        self._proc_thread = t
-        t.start()
-        return t
+        stderr_thread = threading.Thread(target=_reader, args=(proc.stderr,), daemon=True)
+        stderr_thread.start()
+
+        try:
+            while proc.poll() is None:
+                if cancel_event and cancel_event.is_set():
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    break
+                # wait a little
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            try:
+                stderr_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+        return proc.returncode if proc.returncode is not None else -1
+
+    def build_trim_clip(
+        self,
+        src: str,
+        start: float,
+        duration: float,
+        dst: str,
+        extra_video_filters: Optional[str] = None,
+        extra_audio_filters: Optional[str] = None,
+    ) -> None:
+        """
+        Create a trimmed clip from src using -ss and -t (re-encode for uniform output).
+        """
+        args = [
+            "-ss",
+            str(start),
+            "-i",
+            src,
+            "-t",
+            str(duration),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ]
+        vf = []
+        if extra_video_filters:
+            vf.append(extra_video_filters)
+        if vf:
+            args += ["-vf", ",".join(vf)]
+        if extra_audio_filters:
+            args += ["-af", extra_audio_filters]
+
+        args += [dst]
+        # Run blocking
+        ret = subprocess.run([self.ffmpeg_exec, "-y"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if ret.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed creating clip: {ret.stderr.decode(errors='ignore')}")
+
+    def concat_clips(
+        self,
+        clip_paths: List[str],
+        dst: str,
+        on_progress: Optional[Callable[[float], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
+        """
+        Concat clips using ffmpeg concat demuxer.
+        Writes a temporary list file in a format FFmpeg accepts on the current platform.
+        If the demuxer fails, falls back to an encoded filter_complex concat.
+        Returns ffmpeg exit code.
+        """
+        from tempfile import NamedTemporaryFile
+
+        # Filter only existing files and log missing ones
+        existing = []
+        for p in clip_paths:
+            if p and os.path.exists(p):
+                existing.append(p)
+            else:
+                if on_log:
+                    on_log(f"[concat_clips] Skipping non-existent file: {p}")
+
+        if not existing:
+            if on_log:
+                on_log("[concat_clips] No valid input files found for concatenation.")
+            return 1
+
+        # Try concat demuxer first (fast copy)
+        with NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as f:
+            for c in existing:
+                abspath = os.path.abspath(c)
+                if os.name == "nt":
+                    line = 'file "{}"\n'.format(abspath)
+                else:
+                    safe = abspath.replace("'", "'\\''")
+                    line = "file '{}'\n".format(safe)
+                f.write(line)
+            listpath = f.name
+
+        try:
+            args = ["-f", "concat", "-safe", "0", "-i", listpath, "-c", "copy", dst]
+            if on_log:
+                on_log(f"[concat_clips] Attempting concat demuxer with {len(existing)} files.")
+            rc = self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
+            if rc == 0:
+                return rc
+            else:
+                if on_log:
+                    on_log(f"[concat_clips] concat demuxer failed (code {rc}), falling back to filter_complex concat.")
+        finally:
+            try:
+                os.remove(listpath)
+            except Exception:
+                pass
+
+        # Fallback: filter_complex concat with re-encoding.
+        try:
+            n = len(existing)
+            args = []
+            for p in existing:
+                args += ["-i", p]
+
+            # Build filter_complex: [0:v:0][0:a:0][1:v:0][1:a:0]... concat=n={n}:v=1:a=1 [v][a]
+            v_and_a = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+            filter_complex = f"{v_and_a}concat=n={n}:v=1:a=1[v][a]"
+            args += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-c:a", "aac", "-b:a", "192k", dst]
+            if on_log:
+                on_log(f"[concat_clips] Running filter_complex concat (re-encode) for {n} files.")
+            rc2 = self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
+            if on_log and rc2 != 0:
+                on_log(f"[concat_clips] filter_complex concat failed with code {rc2}")
+            return rc2
+        except Exception as e:
+            if on_log:
+                on_log(f"[concat_clips] Exception during fallback concat: {e}")
+            return 1
+
+    def apply_filters(
+        self,
+        src: str,
+        dst: str,
+        vfilter: Optional[str] = None,
+        afilter: Optional[str] = None,
+        on_progress: Optional[Callable[[float], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        extra_args: Optional[List[str]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> int:
+        """
+        Apply video/audio filters to a single source file to produce dst.
+        Returns ffmpeg exit code.
+        """
+        args = ["-i", src]
+        if vfilter:
+            args += ["-vf", vfilter]
+        if afilter:
+            args += ["-af", afilter]
+        if extra_args:
+            args += extra_args
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "192k", dst]
+        return self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
