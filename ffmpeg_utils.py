@@ -17,6 +17,7 @@ import json
 import re
 from typing import Optional, Dict, Any, Callable, List
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from config import ConfigManager
 
 class FFmpegNotFoundError(RuntimeError):
@@ -107,13 +108,15 @@ class FFmpegUtils:
         cancel_event if set will terminate the process when set.
         """
         cmd = [self.ffmpeg_exec, "-y"] + args
+        if on_log:
+            on_log(f"[run_ffmpeg_with_progress] Running: {' '.join(cmd)}")
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1
         )
 
         def _reader(stream):
             for line in stream:
-                line_stripped = line.strip()
+                line_stripped = line.rstrip("\n")
                 if on_log:
                     on_log(line_stripped)
                 m = self.TIME_RE.search(line_stripped)
@@ -141,7 +144,6 @@ class FFmpegUtils:
                         except Exception:
                             pass
                     break
-                # wait a little
                 try:
                     proc.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
@@ -153,6 +155,56 @@ class FFmpegUtils:
                 pass
 
         return proc.returncode if proc.returncode is not None else -1
+
+    def _add_silent_audio_if_needed(self, src: str, on_log: Optional[Callable[[str], None]] = None) -> str:
+        """
+        If `src` lacks an audio stream, create a temporary file with a silent audio track merged and return its path.
+        If audio exists, return original path.
+        """
+        try:
+            info = self.probe(src)
+        except Exception as e:
+            if on_log:
+                on_log(f"[add_silent_audio] ffprobe failed for {src}: {e}")
+            # will attempt to include it; let downstream handle failures
+            return src
+
+        streams = info.get("streams", [])
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        if has_audio:
+            return src
+
+        # create a temp file with silent audio
+        tf = NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_path = tf.name
+        tf.close()
+        # Determine duration to set anullsrc shortness (ffmpeg -shortest will limit to video length)
+        duration = info.get("format", {}).get("duration")
+        if duration is None:
+            duration = 0
+
+        args = [
+            "-i", src,
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            temp_path
+        ]
+        if on_log:
+            on_log(f"[add_silent_audio] Adding silent audio to {src} -> {temp_path}")
+        rc = self.run_ffmpeg_with_progress(args, on_progress=None, on_log=on_log, cancel_event=None)
+        if rc != 0:
+            if on_log:
+                on_log(f"[add_silent_audio] Failed to add silent audio to {src}, rc={rc}")
+            # On failure, remove temp and return original; caller will notice and may fail
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return src
+        return temp_path
 
     def build_trim_clip(
         self,
@@ -210,10 +262,9 @@ class FFmpegUtils:
         Concat clips using ffmpeg concat demuxer.
         Writes a temporary list file in a format FFmpeg accepts on the current platform.
         If the demuxer fails, falls back to an encoded filter_complex concat.
+        Ensures each input has audio (adds silent audio where needed) before filter_complex concat.
         Returns ffmpeg exit code.
         """
-        from tempfile import NamedTemporaryFile
-
         # Filter only existing files and log missing ones
         existing = []
         for p in clip_paths:
@@ -256,14 +307,28 @@ class FFmpegUtils:
             except Exception:
                 pass
 
-        # Fallback: filter_complex concat with re-encoding.
+        # Prepare inputs for fallback: ensure every file has audio stream
+        temp_files_to_cleanup: List[str] = []
+        prepared_inputs: List[str] = []
         try:
-            n = len(existing)
+            for src in existing:
+                try:
+                    prep = self._add_silent_audio_if_needed(src, on_log=on_log)
+                except Exception as e:
+                    if on_log:
+                        on_log(f"[concat_clips] Error while ensuring audio for {src}: {e}")
+                    prep = src
+                if prep != src:
+                    temp_files_to_cleanup.append(prep)
+                prepared_inputs.append(prep)
+
+            n = len(prepared_inputs)
             args = []
-            for p in existing:
+            for p in prepared_inputs:
                 args += ["-i", p]
 
             # Build filter_complex: [0:v:0][0:a:0][1:v:0][1:a:0]... concat=n={n}:v=1:a=1 [v][a]
+            # Validate that inputs are present; if any input is missing streams, ffmpeg will error—this is best-effort.
             v_and_a = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
             filter_complex = f"{v_and_a}concat=n={n}:v=1:a=1[v][a]"
             args += ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]",
@@ -275,10 +340,16 @@ class FFmpegUtils:
             if on_log and rc2 != 0:
                 on_log(f"[concat_clips] filter_complex concat failed with code {rc2}")
             return rc2
-        except Exception as e:
-            if on_log:
-                on_log(f"[concat_clips] Exception during fallback concat: {e}")
-            return 1
+        finally:
+            # cleanup any temporary files we created
+            for tf in temp_files_to_cleanup:
+                try:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                        if on_log:
+                            on_log(f"[concat_clips] Removed temp file {tf}")
+                except Exception:
+                    pass
 
     def apply_filters(
         self,
