@@ -16,9 +16,7 @@ import json
 import re
 from typing import Optional, Dict, Any, Callable, List
 from pathlib import Path
-
 from config import ConfigManager
-
 
 class FFmpegNotFoundError(RuntimeError):
     pass
@@ -205,7 +203,9 @@ class FFmpegUtils:
 
         with NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as f:
             for c in clip_paths:
-                f.write(f"file '{os.path.abspath(c).replace(\"'\", \"'\\''\")}'\n")
+                # use format() to avoid using backslashes inside an f-string expression
+                line = "file '{}'\n".format(os.path.abspath(c).replace("'", "'\\''"))
+                f.write(line)
             listpath = f.name
 
         args = ["-f", "concat", "-safe", "0", "-i", listpath, "-c", "copy", dst]
