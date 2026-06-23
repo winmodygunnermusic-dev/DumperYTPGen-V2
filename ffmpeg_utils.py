@@ -1,3 +1,4 @@
+# ffmpeg_utils.py
 """
 ffmpeg_utils.py
 
@@ -117,11 +118,11 @@ class FFmpegUtils:
                     on_log(line_stripped)
                 m = self.TIME_RE.search(line_stripped)
                 if m and on_progress:
-                    hours = float(m.group(1))
-                    mins = float(m.group(2))
-                    secs = float(m.group(3))
-                    total_seconds = hours * 3600 + mins * 60 + secs
                     try:
+                        hours = float(m.group(1))
+                        mins = float(m.group(2))
+                        secs = float(m.group(3))
+                        total_seconds = hours * 3600 + mins * 60 + secs
                         on_progress(total_seconds)
                     except Exception:
                         pass
@@ -135,18 +136,21 @@ class FFmpegUtils:
                     try:
                         proc.terminate()
                     except Exception:
-                        proc.kill()
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
                     break
-                # wait a bit
-                proc.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            # loop continues
-            pass
-        # wait for thread to finish
-        try:
-            stderr_thread.join(timeout=1.0)
-        except Exception:
-            pass
+                # wait a little
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            try:
+                stderr_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
         return proc.returncode if proc.returncode is not None else -1
 
@@ -160,7 +164,7 @@ class FFmpegUtils:
         extra_audio_filters: Optional[str] = None,
     ) -> None:
         """
-        Create a trimmed clip from src using -ss and -t (fastest copy when possible).
+        Create a trimmed clip from src using -ss and -t (re-encode for uniform output).
         """
         args = [
             "-ss",
@@ -194,33 +198,75 @@ class FFmpegUtils:
         if ret.returncode != 0:
             raise RuntimeError(f"ffmpeg failed creating clip: {ret.stderr.decode(errors='ignore')}")
 
-    def concat_clips(self, clip_paths: list, dst: str, on_progress=None, cancel_event: Optional[threading.Event] = None):
+    def concat_clips(
+        self,
+        clip_paths: List[str],
+        dst: str,
+        on_progress: Optional[Callable[[float], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
         """
         Concat clips using ffmpeg concat demuxer.
+        Writes a temporary list file in a format FFmpeg accepts on the current platform.
+        Skips missing files and logs them. Returns ffmpeg exit code.
         """
-        # create a temporary file list
         from tempfile import NamedTemporaryFile
 
+        # Filter only existing files and log missing ones
+        existing = []
+        for p in clip_paths:
+            if p and os.path.exists(p):
+                existing.append(p)
+            else:
+                if on_log:
+                    on_log(f"[concat_clips] Skipping non-existent file: {p}")
+
+        if not existing:
+            if on_log:
+                on_log("[concat_clips] No valid input files found for concatenation.")
+            return 1
+
+        # Create list file appropriate for platform
         with NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as f:
-            for c in clip_paths:
-                # use format() to avoid using backslashes inside an f-string expression
-                line = "file '{}'\n".format(os.path.abspath(c).replace("'", "'\\''"))
+            for c in existing:
+                abspath = os.path.abspath(c)
+                if os.name == "nt":
+                    # Windows: use double quotes around the path (avoids issues with backslashes)
+                    line = 'file "{}"\n'.format(abspath)
+                else:
+                    # POSIX: escape single quotes and use single-quoted path
+                    safe = abspath.replace("'", "'\\''")
+                    line = "file '{}'\n".format(safe)
                 f.write(line)
             listpath = f.name
 
-        args = ["-f", "concat", "-safe", "0", "-i", listpath, "-c", "copy", dst]
         try:
-            return self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=None, cancel_event=cancel_event)
+            args = ["-f", "concat", "-safe", "0", "-i", listpath, "-c", "copy", dst]
+            rc = self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
+            if rc != 0 and on_log:
+                on_log(f"[concat_clips] ffmpeg concat demuxer returned code {rc}")
+            return rc
         finally:
             try:
                 os.remove(listpath)
             except Exception:
                 pass
 
-    def apply_filters(self, src: str, dst: str, vfilter: Optional[str] = None, afilter: Optional[str] = None,
-                      on_progress=None, cancel_event: Optional[threading.Event] = None, extra_args: Optional[list] = None):
+    def apply_filters(
+        self,
+        src: str,
+        dst: str,
+        vfilter: Optional[str] = None,
+        afilter: Optional[str] = None,
+        on_progress: Optional[Callable[[float], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        extra_args: Optional[List[str]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+    ) -> int:
         """
         Apply video/audio filters to a single source file to produce dst.
+        Returns ffmpeg exit code.
         """
         args = ["-i", src]
         if vfilter:
@@ -230,4 +276,4 @@ class FFmpegUtils:
         if extra_args:
             args += extra_args
         args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac", "-b:a", "192k", dst]
-        return self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=None, cancel_event=cancel_event)
+        return self.run_ffmpeg_with_progress(args, on_progress=on_progress, on_log=on_log, cancel_event=cancel_event)
