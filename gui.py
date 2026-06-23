@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 import json
 import random
+import shutil
 
 from config import ConfigManager
 from library_manager import LibraryManager
@@ -38,19 +39,19 @@ class DumperYTPApp(tk.Tk):
         self.minsize(900, 600)
 
         # Core managers
-        self.config = ConfigManager()
+        self.config_manager = ConfigManager()
         try:
-            self.ffutils = FFmpegUtils(self.config)
+            self.ffutils = FFmpegUtils(self.config_manager)
         except FFmpegNotFoundError as e:
             # Allow app to open but show warning
             self.ffutils = None
             messagebox.showwarning("FFmpeg not found", str(e))
 
-        self.library = LibraryManager(self.config)
-        self.clipgen = ClipGenerator(self.config, self.ffutils) if self.ffutils else None
+        self.library = LibraryManager(self.config_manager)
+        self.clipgen = ClipGenerator(self.config_manager, self.ffutils) if self.ffutils else None
         self.effect_engine = EffectEngine(self.ffutils) if self.ffutils else None
-        self.project_manager = ProjectManager(self.config)
-        self.export_manager = ExportManager(self.config, self.ffutils) if self.ffutils else None
+        self.project_manager = ProjectManager(self.config_manager)
+        self.export_manager = ExportManager(self.config_manager, self.ffutils) if self.ffutils else None
 
         self._build_menu()
         self._build_ui()
@@ -62,7 +63,7 @@ class DumperYTPApp(tk.Tk):
         self.cancel_event = threading.Event()
 
         # seed
-        seed = self.config.get("random_seed")
+        seed = self.config_manager.get("random_seed")
         if seed:
             random.seed(seed)
 
@@ -85,6 +86,7 @@ class DumperYTPApp(tk.Tk):
         helpmenu.add_command(label="About", command=lambda: messagebox.showinfo("About", "DumperYTPGen\nA YTP auto-generator"))
         menubar.add_cascade(label="Help", menu=helpmenu)
 
+        # Use Tk.config to set the menu (no name conflict now)
         self.config(menu=menubar)
 
     def _build_ui(self):
@@ -138,7 +140,7 @@ class DumperYTPApp(tk.Tk):
             self.lib_listboxes[lib] = lb
 
             # populate
-            for p in self.config.get_library(lib):
+            for p in self.config_manager.get_library(lib):
                 lb.insert(tk.END, p)
 
         # Controls
@@ -199,8 +201,13 @@ class DumperYTPApp(tk.Tk):
         if not rp:
             messagebox.showinfo("Recent Projects", "No recent projects.")
             return
-        choice = simpledialog.askstring("Recent Projects", "Choose project path:\n" + "\n".join(rp))
-        # not trying to parse—user can copy/paste
+        # show a simple selection dialog
+        top = tk.Toplevel(self)
+        top.title("Recent Projects")
+        lb = tk.Listbox(top)
+        lb.pack(fill=tk.BOTH, expand=True)
+        for p in rp:
+            lb.insert(tk.END, p)
 
     # ---------- Auto Clips Tab ----------
     def _build_auto_clips_tab(self):
@@ -236,7 +243,7 @@ class DumperYTPApp(tk.Tk):
         if not self.clipgen:
             messagebox.showerror("FFmpeg Missing", "FFmpeg utilities unavailable. Configure paths first.")
             return
-        videos = self.config.get_library("videos")
+        videos = self.config_manager.get_library("videos")
         if not videos:
             messagebox.showerror("No sources", "No video sources in library.")
             return
@@ -250,10 +257,14 @@ class DumperYTPApp(tk.Tk):
         self.cancel_event.clear()
 
         def on_progress(idx, total, path):
-            self.progress_var.set(100.0 * idx / total)
-            self.status_var.set(f"Generated {idx}/{total}")
-            self.clips_listbox.insert(tk.END, path)
-            self.generated_clips.append(path)
+            # Some ClipGenerator callbacks use (idx, total, path)
+            try:
+                self.progress_var.set(100.0 * idx / total)
+                self.status_var.set(f"Generated {idx}/{total}")
+                self.clips_listbox.insert(tk.END, path)
+                self.generated_clips.append(path)
+            except Exception:
+                pass
 
         def worker():
             try:
@@ -357,7 +368,6 @@ class DumperYTPApp(tk.Tk):
                         pos = random.choice(["top-left", "top-right", "center", "bottom-left", "bottom-right"])
                         self.effect_engine.add_subtitle_text(tmpsrc, dst, text, position=pos)
                     else:
-                        # copy
                         shutil.copy(tmpsrc, dst)
                     tmpsrc = dst
                 # finally, replace item in list with final dst
@@ -379,7 +389,6 @@ class DumperYTPApp(tk.Tk):
             try:
                 for i, path in enumerate(all_items):
                     chosen = random.sample(["speed_change", "reverse", "freeze_frame", "ear_rape", "subtitle_random"], k=random.randint(1, 2))
-                    # reuse apply_effects_to_clip logic by calling effect_engine directly
                     tmpsrc = path
                     for e in chosen:
                         dst = str(Path(tmpsrc).with_suffix(f".{e}.mp4"))
@@ -424,7 +433,7 @@ class DumperYTPApp(tk.Tk):
         # dance music mode
         ttk.Label(frm, text="Dance Music Mode: Select music track").grid(row=0, column=0, sticky=tk.W)
         self.dance_listbox = tk.Listbox(frm)
-        for p in self.config.get_library("dance"):
+        for p in self.config_manager.get_library("dance"):
             self.dance_listbox.insert(tk.END, p)
         self.dance_listbox.grid(row=1, column=0, sticky=tk.NSEW)
         frm.grid_rowconfigure(1, weight=1)
@@ -459,7 +468,7 @@ class DumperYTPApp(tk.Tk):
                     self.ffutils.build_trim_clip(c, 0, beat, dst)
                     out_clips.append(dst)
                 # concat
-                out_final = str(Path(self.config.get("temp_dir")) / f"dance_{int(time.time())}.mp4")
+                out_final = str(Path(self.config_manager.get("temp_dir")) / f"dance_{int(time.time())}.mp4")
                 self.ffutils.concat_clips(out_clips, out_final)
                 messagebox.showinfo("Dance Montage Ready", f"Dance montage created: {out_final}\nYou can preview or export it.")
                 self.status_var.set("Dance montage ready")
@@ -480,7 +489,7 @@ class DumperYTPApp(tk.Tk):
 
         ttk.Label(frm, text="Overlay images/videos (from Images/Transitions libraries)").pack()
         self.overlays_listbox = tk.Listbox(frm)
-        for p in self.config.get_library("images") + self.config.get_library("transitions"):
+        for p in self.config_manager.get_library("images") + self.config_manager.get_library("transitions"):
             self.overlays_listbox.insert(tk.END, p)
         self.overlays_listbox.pack(fill=tk.BOTH, expand=True)
         ttk.Button(frm, text="Add Random Overlay to Project", command=self.add_random_overlay).pack(pady=2)
@@ -515,7 +524,7 @@ class DumperYTPApp(tk.Tk):
         frm.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         ttk.Label(frm, text="Output file:").grid(row=0, column=0, sticky=tk.W)
-        self.output_path_var = tk.StringVar(value=str(Path(self.config.get("last_project_dir")) / "output.mp4"))
+        self.output_path_var = tk.StringVar(value=str(Path(self.config_manager.get("last_project_dir")) / "output.mp4"))
         ttk.Entry(frm, textvariable=self.output_path_var, width=60).grid(row=0, column=1, sticky=tk.EW)
         ttk.Button(frm, text="Browse...", command=self.browse_output).grid(row=0, column=2, sticky=tk.E)
 
@@ -535,7 +544,7 @@ class DumperYTPApp(tk.Tk):
         path = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 video", "*.mp4")])
         if path:
             self.output_path_var.set(path)
-            self.config.set("last_project_dir", str(Path(path).parent))
+            self.config_manager.set("last_project_dir", str(Path(path).parent))
 
     def export_ytp(self):
         if not self.export_manager:
@@ -554,7 +563,8 @@ class DumperYTPApp(tk.Tk):
         self.export_log.delete("1.0", tk.END)
         self.status_var.set("Starting export...")
         self.progress_var.set(0.0)
-        self.export_manager._cancel_event.clear()
+        if self.export_manager:
+            self.export_manager._cancel_event.clear()
 
         def on_progress(seconds):
             # naive percent mapping: since we don't know total, just show animated progress
@@ -564,8 +574,11 @@ class DumperYTPApp(tk.Tk):
             self.export_log.insert(tk.END, line + "\n")
             self.export_log.see(tk.END)
 
-        self.export_manager.export_project(clips, overlays, sfx_entries, music, output, bitrate=bitrate, on_progress=on_progress, on_log=on_log)
-        self.status_var.set("Export running in background")
+        if self.export_manager:
+            self.export_manager.export_project(clips, overlays, sfx_entries, music, output, bitrate=bitrate, on_progress=on_progress, on_log=on_log)
+            self.status_var.set("Export running in background")
+        else:
+            messagebox.showerror("Export unavailable", "Export manager not initialized (FFmpeg missing).")
 
     def cancel_export(self):
         if self.export_manager:
@@ -613,12 +626,13 @@ class DumperYTPApp(tk.Tk):
     def set_ffmpeg_path(self):
         path = filedialog.askopenfilename(title="Select ffmpeg executable")
         if path:
-            self.config.set("ffmpeg_path", path)
+            self.config_manager.set("ffmpeg_path", path)
             messagebox.showinfo("Saved", "FFmpeg path saved; restart app to re-detect.")
+
     def set_ffprobe_path(self):
         path = filedialog.askopenfilename(title="Select ffprobe executable")
         if path:
-            self.config.set("ffprobe_path", path)
+            self.config_manager.set("ffprobe_path", path)
             messagebox.showinfo("Saved", "FFprobe path saved; restart app to re-detect.")
 
 
